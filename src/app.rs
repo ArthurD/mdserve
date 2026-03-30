@@ -14,6 +14,7 @@ use minijinja::{context, value::Value, Environment};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
@@ -30,6 +31,7 @@ const TEMPLATE_NAME: &str = "main.html";
 static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
 const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
 const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
+const MAX_PORT_ATTEMPTS: u16 = 10;
 
 const EXCLUDED_DIRS: &[&str] = &["node_modules", "target", "__pycache__", "dist", "build"];
 
@@ -61,21 +63,11 @@ fn template_env() -> &'static Environment<'static> {
     })
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
-enum ClientMessage {
-    Ping,
-    RequestRefresh,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 enum ServerMessage {
     Reload,
-    Pong,
 }
-
-use std::collections::HashMap;
 
 pub(crate) fn scan_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut md_files = Vec::new();
@@ -246,16 +238,10 @@ impl MarkdownState {
 
     fn refresh_file(&mut self, filename: &str) -> Result<()> {
         if let Some(tracked) = self.tracked_files.get_mut(filename) {
-            let metadata = fs::metadata(&tracked.path)?;
-            let current_modified = metadata.modified()?;
-
-            if current_modified > tracked.last_modified {
-                let content = fs::read_to_string(&tracked.path)?;
-                tracked.html = Self::markdown_to_html(&content)?;
-                tracked.last_modified = current_modified;
-            }
+            let content = fs::read_to_string(&tracked.path)?;
+            tracked.html = Self::markdown_to_html(&content)?;
+            tracked.last_modified = fs::metadata(&tracked.path)?.modified()?;
         }
-
         Ok(())
     }
 
@@ -456,6 +442,29 @@ fn new_router(
     Ok(router)
 }
 
+async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)> {
+    let mut last_err = None;
+    for offset in 0..MAX_PORT_ATTEMPTS {
+        let try_port = match port.checked_add(offset) {
+            Some(p) => p,
+            None => break,
+        };
+        match TcpListener::bind((hostname, try_port)).await {
+            Ok(listener) => return Ok((listener, try_port)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => last_err = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_err
+        .map(|e| anyhow::anyhow!(e))
+        .unwrap_or_else(|| anyhow::anyhow!("no valid port in range"))
+        .context(format!(
+            "could not bind to ports {}--{}",
+            port,
+            port.saturating_add(MAX_PORT_ATTEMPTS - 1)
+        )))
+}
+
 pub(crate) async fn serve_markdown(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
@@ -469,9 +478,13 @@ pub(crate) async fn serve_markdown(
     let first_file = tracked_files.first().cloned();
     let router = new_router(base_dir.clone(), tracked_files, is_directory_mode)?;
 
-    let listener = TcpListener::bind((hostname, port)).await?;
+    let (listener, actual_port) = bind_with_retry(hostname, port).await?;
 
-    let listen_addr = format_host(hostname, port);
+    if actual_port != port {
+        println!("⚠ Port {port} in use, using {actual_port} instead");
+    }
+
+    let listen_addr = format_host(hostname, actual_port);
 
     if is_directory_mode {
         println!("📁 Serving markdown files from: {}", base_dir.display());
@@ -484,7 +497,7 @@ pub(crate) async fn serve_markdown(
     println!("\nPress Ctrl+C to stop the server");
 
     if open {
-        let browse_addr = format_host(&browsable_host(hostname), port);
+        let browse_addr = format_host(&browsable_host(hostname), actual_port);
         open_browser(&format!("http://{browse_addr}"))?;
     }
 
@@ -557,7 +570,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 async fn serve_html_root(State(state): State<SharedMarkdownState>) -> impl IntoResponse {
-    let mut state = state.lock().await;
+    let state = state.lock().await;
 
     let filename = match state.get_sorted_filenames().into_iter().next() {
         Some(name) => name,
@@ -569,8 +582,6 @@ async fn serve_html_root(State(state): State<SharedMarkdownState>) -> impl IntoR
         }
     };
 
-    let _ = state.refresh_file(&filename);
-
     render_markdown(&state, &filename).await
 }
 
@@ -579,13 +590,11 @@ async fn serve_file(
     State(state): State<SharedMarkdownState>,
 ) -> axum::response::Response {
     if filename.ends_with(".md") || filename.ends_with(".markdown") {
-        let mut state = state.lock().await;
+        let state = state.lock().await;
 
         if !state.tracked_files.contains_key(&filename) {
             return (StatusCode::NOT_FOUND, Html("File not found".to_string())).into_response();
         }
-
-        let _ = state.refresh_file(&filename);
 
         let (status, html) = render_markdown(&state, &filename).await;
         (status, html).into_response()
@@ -733,15 +742,7 @@ async fn serve_static_file_inner(
 }
 
 fn is_image_file(file_path: &str) -> bool {
-    let extension = std::path::Path::new(file_path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("");
-
-    matches!(
-        extension.to_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico"
-    )
+    guess_image_content_type(file_path).starts_with("image/")
 }
 
 fn guess_image_content_type(file_path: &str) -> String {
@@ -781,13 +782,7 @@ async fn handle_websocket(socket: WebSocket, state: SharedMarkdownState) {
     let recv_task = tokio::spawn(async move {
         while let Some(msg) = receiver.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                        match client_msg {
-                            ClientMessage::Ping | ClientMessage::RequestRefresh => {}
-                        }
-                    }
-                }
+                Ok(Message::Text(_)) => {}
                 Ok(Message::Close(_)) => break,
                 _ => {}
             }
@@ -1036,6 +1031,23 @@ mod tests {
         assert_eq!(browsable_host("example.com"), "example.com");
     }
 
+    #[tokio::test]
+    async fn test_bind_retries_on_addr_in_use() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked_port = listener.local_addr().unwrap().port();
+
+        let (retry_listener, actual_port) =
+            bind_with_retry("127.0.0.1", blocked_port).await.unwrap();
+
+        assert!(
+            actual_port > blocked_port,
+            "Should bind to a higher port when requested port is in use"
+        );
+
+        drop(retry_listener);
+        drop(listener);
+    }
+
     use axum_test::TestServer;
     use std::time::Duration;
     use tempfile::{Builder, NamedTempFile, TempDir};
@@ -1171,18 +1183,7 @@ mod tests {
         )
         .await;
 
-        match update_result {
-            Ok(update_message) => {
-                if let ServerMessage::Reload = update_message {
-                    // Success
-                } else {
-                    panic!("Expected Reload message after file modification");
-                }
-            }
-            Err(_) => {
-                panic!("Timeout waiting for WebSocket update after file modification");
-            }
-        }
+        update_result.expect("Timeout waiting for WebSocket update after file modification");
     }
 
     #[tokio::test]
@@ -1613,18 +1614,7 @@ classDiagram
         )
         .await;
 
-        match update_result {
-            Ok(update_message) => {
-                if let ServerMessage::Reload = update_message {
-                    // Success
-                } else {
-                    panic!("Expected Reload message after file modification");
-                }
-            }
-            Err(_) => {
-                panic!("Timeout waiting for WebSocket update after file modification");
-            }
-        }
+        update_result.expect("Timeout waiting for WebSocket update after file modification");
     }
 
     #[tokio::test]
@@ -1644,18 +1634,7 @@ classDiagram
         )
         .await;
 
-        match update_result {
-            Ok(update_message) => {
-                if let ServerMessage::Reload = update_message {
-                    // Success
-                } else {
-                    panic!("Expected Reload message after new file creation");
-                }
-            }
-            Err(_) => {
-                panic!("Timeout waiting for WebSocket update after new file creation");
-            }
-        }
+        update_result.expect("Timeout waiting for WebSocket update after new file creation");
 
         let response = server.get("/test1.md").await;
         assert_eq!(response.status_code(), 200);
@@ -1855,18 +1834,7 @@ classDiagram
         )
         .await;
 
-        match update_result {
-            Ok(update_message) => {
-                if let ServerMessage::Reload = update_message {
-                    // Success
-                } else {
-                    panic!("Expected Reload message after temp file rename");
-                }
-            }
-            Err(_) => {
-                panic!("Timeout waiting for WebSocket update after temp file rename");
-            }
-        }
+        update_result.expect("Timeout waiting for WebSocket update after temp file rename");
 
         let final_response = server.get("/").await;
         assert_eq!(final_response.status_code(), 200);
@@ -1915,20 +1883,9 @@ classDiagram
         )
         .await;
 
-        match update_result {
-            Ok(update_message) => {
-                if let ServerMessage::Reload = update_message {
-                    // Success
-                } else {
-                    panic!("Expected Reload message after temp file rename in directory mode");
-                }
-            }
-            Err(_) => {
-                panic!(
-                    "Timeout waiting for WebSocket update after temp file rename in directory mode"
-                );
-            }
-        }
+        update_result.expect(
+            "Timeout waiting for WebSocket update after temp file rename in directory mode",
+        );
 
         let final_response = server.get("/test1.md").await;
         assert_eq!(final_response.status_code(), 200);
